@@ -10,6 +10,7 @@ Adapted from nanoGPT's data/openwebtext/prepare.py with:
 
 Usage:
   uv run python data/fineweb_edu/prepare.py --tokenizer allenai/Olmo-3-1025-7B
+  uv run python data/fineweb_edu/prepare.py --tokenizer allenai/Olmo-3-1025-7B --max_tokens 5_000_000_000
   uv run python data/fineweb_edu/prepare.py --tokenizer Qwen/Qwen3-8B --out_dir data/fineweb_edu_qwen
 """
 
@@ -65,6 +66,12 @@ def main():
         default=None,
         help="Output directory (default: same directory as this script)",
     )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=None,
+        help="Max tokens to write to train.bin (truncates documents to fit). Val split is unaffected.",
+    )
     args = parser.parse_args()
 
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +113,11 @@ def main():
     # Write to memmap .bin files (uint32)
     for split, dset in tokenized.items():
         arr_len = np.sum(dset["len"], dtype=np.uint64)
+        max_tokens = args.max_tokens if (args.max_tokens and split == "train") else None
+        if max_tokens and arr_len > max_tokens:
+            print(f"{split}: truncating from {arr_len:,} to {max_tokens:,} tokens")
+            arr_len = max_tokens
+
         filename = os.path.join(out_dir, f"{split}.bin")
         dtype = np.uint32  # vocab sizes > 65535
         arr = np.memmap(filename, dtype=dtype, mode="w+", shape=(arr_len,))
@@ -113,10 +125,16 @@ def main():
 
         idx = 0
         for batch_idx in tqdm(range(total_batches), desc=f"Writing {filename}"):
+            if idx >= arr_len:
+                break
             batch = dset.shard(
                 num_shards=total_batches, index=batch_idx, contiguous=True
             ).with_format("numpy")
             arr_batch = np.concatenate(batch["ids"])
+            # Truncate if this batch would exceed the limit
+            remaining = arr_len - idx
+            if len(arr_batch) > remaining:
+                arr_batch = arr_batch[:remaining]
             arr[idx : idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
         arr.flush()
