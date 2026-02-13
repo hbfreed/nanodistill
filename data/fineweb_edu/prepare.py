@@ -69,8 +69,8 @@ def main():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=None,
-        help="Max tokens to write to train.bin (truncates documents to fit). Val split is unaffected.",
+        default=5_000_000_000,
+        help="Max tokens to write to train.bin (default: 5B). Val split is unaffected.",
     )
     args = parser.parse_args()
 
