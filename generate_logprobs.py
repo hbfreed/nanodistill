@@ -1,7 +1,7 @@
 """Pre-compute teacher top-k logprobs for distillation.
 
 Reads tokenized data from a .bin memmap file, runs a teacher model,
-and saves (input_ids, topk_indices, topk_logprobs) as an HF Dataset.
+and saves (input_ids, topk_indices, topk_logprobs) as parquet shards.
 
 Adapted from variable-flex-olmo/scripts/generate_logprobs.py.
 
@@ -11,14 +11,14 @@ Usage:
       --teacher allenai/Olmo-3-1025-7B \
       --data data/fineweb_edu/train.bin \
       --batch_size 8 \
-      --output hbfreed/olmo7b-fineweb-logprobs
+      --output /media/henry/MoreFiles/olmo3-base-logprobs
 
   # Multi-GPU data parallelism (each GPU gets a copy of the model):
   torchrun --standalone --nproc_per_node=4 generate_logprobs.py \
       --teacher allenai/Olmo-3-1025-7B \
       --data data/fineweb_edu/train.bin \
       --batch_size 8 \
-      --output hbfreed/olmo7b-fineweb-logprobs
+      --output /media/henry/MoreFiles/olmo3-base-logprobs
 
   # Single-process model parallelism (large model split across GPUs):
   uv run python generate_logprobs.py \
@@ -26,7 +26,7 @@ Usage:
       --data data/fineweb_edu/train.bin \
       --batch_size 8 \
       --device_map auto \
-      --output hbfreed/olmo7b-fineweb-logprobs
+      --output /media/henry/MoreFiles/olmo3-base-logprobs
 
   # Quantized teacher (int4):
   uv run python generate_logprobs.py \
@@ -34,7 +34,7 @@ Usage:
       --data data/fineweb_edu/train.bin \
       --batch_size 8 \
       --quantize int4 \
-      --output hbfreed/olmo7b-fineweb-logprobs-int4
+      --output /media/henry/MoreFiles/olmo3-base-logprobs-int4
 """
 
 import argparse
@@ -63,6 +63,28 @@ def extract_topk_logprobs(logits, k):
     return topk_logprobs.half(), topk_indices.int()
 
 
+def read_batch_from_memmap(data, chunk_indices, n_ctx, batch_size, batch_idx):
+    """Read a batch of chunks directly from memmap without pre-loading."""
+    start_idx = batch_idx * batch_size
+    end_idx = min(start_idx + batch_size, len(chunk_indices))
+    batch = torch.zeros(end_idx - start_idx, n_ctx, dtype=torch.long)
+    for i, ci in enumerate(chunk_indices[start_idx:end_idx]):
+        offset = ci * n_ctx
+        batch[i] = torch.from_numpy(data[offset : offset + n_ctx].astype(np.int64))
+    return batch
+
+
+def flush_shard(rows, output_path, shard_name, is_hub, rank):
+    """Write accumulated rows as a parquet shard (or push to hub)."""
+    shard = Dataset.from_list(rows)
+    if is_hub:
+        shard.push_to_hub(output_path, split=shard_name)
+    else:
+        os.makedirs(output_path, exist_ok=True)
+        shard.to_parquet(os.path.join(output_path, f"{shard_name}.parquet"))
+    print(f"[rank {rank}] Saved {shard_name} ({len(rows)} rows)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate teacher logprobs for distillation")
     parser.add_argument("--teacher", type=str, required=True, help="HF model name for teacher")
@@ -72,6 +94,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=128, help="Number of top logprobs to save")
     parser.add_argument("--output", type=str, required=True, help="HF Hub repo or local directory")
     parser.add_argument("--max_chunks", type=int, default=-1, help="Max chunks to process (-1 for all)")
+    parser.add_argument("--rows_per_shard", type=int, default=2048, help="Rows per parquet shard")
     parser.add_argument("--quantize", type=str, default=None, choices=["int8", "int4"],
                         help="Quantize teacher model (int8 or int4 via bitsandbytes)")
     parser.add_argument("--device_map", type=str, default=None,
@@ -107,7 +130,7 @@ def main():
     else:
         device_map = "auto"
 
-    # Load tokenized data as memmap and chunk into sequences
+    # Open memmap (no data copied to RAM)
     if is_main:
         print(f"Loading tokenized data from {args.data}...")
     data = np.memmap(args.data, dtype=np.uint32, mode="r")
@@ -118,18 +141,10 @@ def main():
     if is_main:
         print(f"Total tokens: {num_tokens:,}, chunks of {args.n_ctx}: {num_chunks:,}")
 
-    # Shard chunks across ranks
-    all_chunk_indices = list(range(num_chunks))
-    my_chunk_indices = all_chunk_indices[rank::world_size]
+    # Shard chunks across ranks (just indices, no data)
+    my_chunk_indices = list(range(rank, num_chunks, world_size))
     if is_main:
         print(f"Rank {rank}/{world_size}: processing {len(my_chunk_indices)} chunks")
-
-    # Build this rank's chunks tensor (on CPU, pinned for async transfer)
-    chunks = torch.zeros(len(my_chunk_indices), args.n_ctx, dtype=torch.long)
-    for i, chunk_idx in enumerate(my_chunk_indices):
-        start = chunk_idx * args.n_ctx
-        chunks[i] = torch.from_numpy(data[start : start + args.n_ctx].astype(np.int64))
-    chunks = chunks.pin_memory()
 
     # Load teacher model
     quant_config = None
@@ -163,14 +178,9 @@ def main():
             print("Compiling model with torch.compile...")
         model = torch.compile(model, mode="default")
 
-    # Arrow list columns use 32-bit offsets; cap rows per shard to stay under ~2GB
-    per_row_topk = args.n_ctx * args.top_k
-    max_rows_by_bytes = (2**31 - 1) // (per_row_topk * 4)  # int32 is tightest
-    rows_per_shard = max(1, max_rows_by_bytes)
-
     rows = []
     shard_idx = 0
-    num_batches = len(chunks) // args.batch_size
+    num_batches = len(my_chunk_indices) // args.batch_size
 
     # Determine if output is local path or HF Hub repo (e.g. "user/repo-name")
     is_hub = "/" in args.output and not os.path.isabs(args.output) and not args.output.startswith(".")
@@ -178,22 +188,18 @@ def main():
     # Use rank-prefixed shard names to avoid collisions
     shard_prefix = f"rank{rank}_" if world_size > 1 else ""
 
-    for batch_start in tqdm(
-        range(0, num_batches * args.batch_size, args.batch_size),
-        desc=f"[rank {rank}] Processing",
-        disable=not is_main,
-    ):
-        batch = chunks[batch_start : batch_start + args.batch_size].to(
-            model.device, non_blocking=True
-        )
+    for batch_idx in tqdm(range(num_batches), desc=f"[rank {rank}] Processing", disable=not is_main):
+        # Stream batch from memmap
+        batch = read_batch_from_memmap(data, my_chunk_indices, args.n_ctx, args.batch_size, batch_idx)
+        batch_gpu = batch.to(model.device, non_blocking=True)
 
         with torch.inference_mode():
-            logits = model(batch).logits  # [batch, seq, vocab]
+            logits = model(batch_gpu).logits
 
         topk_logprobs, topk_indices = extract_topk_logprobs(logits, args.top_k)
 
-        # Transfer to CPU
-        batch_ids = chunks[batch_start : batch_start + args.batch_size].numpy()
+        # Transfer to CPU numpy
+        batch_ids = batch.numpy()
         topk_indices_np = topk_indices.cpu().numpy()
         topk_logprobs_np = topk_logprobs.cpu().numpy()
 
@@ -205,26 +211,16 @@ def main():
             })
 
         # Flush shard if needed
-        if len(rows) >= rows_per_shard:
-            shard = Dataset.from_list(rows)
-            split_name = f"train_{shard_prefix}{shard_idx}"
-            if is_hub:
-                shard.push_to_hub(args.output, split=split_name)
-            else:
-                shard.save_to_disk(f"{args.output}/{split_name}")
-            print(f"[rank {rank}] Saved shard {split_name} ({len(rows)} rows)")
+        if len(rows) >= args.rows_per_shard:
+            shard_name = f"train_{shard_prefix}{shard_idx}"
+            flush_shard(rows, args.output, shard_name, is_hub, rank)
             rows = []
             shard_idx += 1
 
     # Flush remaining rows
     if rows:
-        shard = Dataset.from_list(rows)
-        split_name = f"train_{shard_prefix}{shard_idx}"
-        if is_hub:
-            shard.push_to_hub(args.output, split=split_name)
-        else:
-            shard.save_to_disk(f"{args.output}/{split_name}")
-        print(f"[rank {rank}] Saved final shard {split_name} ({len(rows)} rows)")
+        shard_name = f"train_{shard_prefix}{shard_idx}"
+        flush_shard(rows, args.output, shard_name, is_hub, rank)
 
     if is_main:
         total_shards = (shard_idx + 1) * world_size
