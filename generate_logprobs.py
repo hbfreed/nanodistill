@@ -172,8 +172,8 @@ def main():
     shard_idx = 0
     num_batches = len(chunks) // args.batch_size
 
-    # Determine if output is local or hub
-    is_hub = "/" in args.output and not args.output.startswith(".")
+    # Determine if output is local path or HF Hub repo (e.g. "user/repo-name")
+    is_hub = "/" in args.output and not os.path.isabs(args.output) and not args.output.startswith(".")
 
     # Use rank-prefixed shard names to avoid collisions
     shard_prefix = f"rank{rank}_" if world_size > 1 else ""
