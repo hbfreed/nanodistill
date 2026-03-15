@@ -47,7 +47,7 @@ def create_student(
         **kwargs,
     )
 
-    model = Olmo3ForCausalLM(config)  # replace
+    model = Olmo3ForCausalLM(config)
     return model
 
 
@@ -79,6 +79,103 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type)
     print(f"using fused AdamW: {use_fused}")
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
     return optimizer
+
+
+def configure_muon_adamw(model, matrix_lr=0.02, embedding_lr=0.2, unembedding_lr=0.008,
+                          weight_decay=0.0, adam_betas=(0.8, 0.95), adam_eps=1e-10):
+    """Create MuonAdamW optimizer with nanochat-style parameter routing.
+
+    Parameter routing:
+      - embed_tokens.weight → AdamW at embedding_lr
+      - lm_head.weight → AdamW at unembedding_lr
+      - RMSNorm weights (1D) → AdamW at matrix_lr (no weight decay)
+      - Q/K/V projections → Muon at matrix_lr with per-head Muon Split
+      - All other 2D weight matrices → Muon at matrix_lr
+    """
+    from optim import MuonAdamW
+
+    # Extract head counts from model config for Muon Split
+    num_q_heads = model.config.num_attention_heads
+    num_kv_heads = model.config.num_key_value_heads
+
+    embed_params = []
+    unembed_params = []
+    scalar_params = []
+    muon_params_by_shape = {}  # shape -> list of params
+    muon_split_params = {}  # (shape, n_heads) -> list of params
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "embed_tokens" in name:
+            embed_params.append(param)
+        elif "lm_head" in name:
+            unembed_params.append(param)
+        elif param.dim() < 2:
+            scalar_params.append(param)
+        elif "q_proj" in name:
+            key = (param.shape, num_q_heads)
+            muon_split_params.setdefault(key, []).append(param)
+        elif "k_proj" in name or "v_proj" in name:
+            key = (param.shape, num_kv_heads)
+            muon_split_params.setdefault(key, []).append(param)
+        else:
+            # 2D params -> Muon, grouped by shape for batch orthogonalization
+            shape = param.shape
+            if shape not in muon_params_by_shape:
+                muon_params_by_shape[shape] = []
+            muon_params_by_shape[shape].append(param)
+
+    param_groups = []
+
+    # AdamW groups
+    if embed_params:
+        param_groups.append({
+            "params": embed_params, "kind": "adamw", "lr": embedding_lr,
+            "betas": (0.8, 0.995), "eps": adam_eps, "weight_decay": 0.001,
+            "initial_lr": embedding_lr,
+        })
+    if unembed_params:
+        param_groups.append({
+            "params": unembed_params, "kind": "adamw", "lr": unembedding_lr,
+            "betas": (0.8, 0.96), "eps": adam_eps, "weight_decay": 0.01,
+            "initial_lr": unembedding_lr,
+        })
+    if scalar_params:
+        param_groups.append({
+            "params": scalar_params, "kind": "adamw", "lr": matrix_lr,
+            "betas": adam_betas, "eps": adam_eps, "weight_decay": 0.0,
+            "initial_lr": matrix_lr,
+        })
+
+    # Muon Split groups (Q/K/V — per-head orthogonalization)
+    for (shape, n_heads), params in sorted(muon_split_params.items()):
+        param_groups.append({
+            "params": params, "kind": "muon", "lr": matrix_lr,
+            "momentum": 0.95, "ns_steps": 5, "weight_decay": weight_decay,
+            "initial_lr": matrix_lr, "n_heads": n_heads,
+        })
+
+    # Muon groups (MLP, o_proj — standard orthogonalization)
+    for shape, params in sorted(muon_params_by_shape.items()):
+        param_groups.append({
+            "params": params, "kind": "muon", "lr": matrix_lr,
+            "momentum": 0.95, "ns_steps": 5, "weight_decay": weight_decay,
+            "initial_lr": matrix_lr,
+        })
+
+    # Print summary
+    total_muon = sum(p.numel() for pg in param_groups if pg["kind"] == "muon" for p in pg["params"])
+    total_adam = sum(p.numel() for pg in param_groups if pg["kind"] == "adamw" for p in pg["params"])
+    n_scalar = sum(p.numel() for p in scalar_params)
+    print(f"MuonAdamW: {total_muon:,} Muon params, {total_adam:,} AdamW params, {n_scalar} scalar params")
+    for pg in param_groups:
+        n = sum(p.numel() for p in pg["params"])
+        shapes = {p.shape for p in pg["params"]}
+        split_info = f" split={pg['n_heads']}h" if pg.get("n_heads") else ""
+        print(f"  {pg['kind']:>5s} lr={pg['lr']:.4f}: {len(pg['params'])} tensors, {n:,} params, shapes={shapes}{split_info}")
+
+    return MuonAdamW(param_groups)
 
 
 def count_parameters(model) -> dict:
@@ -131,5 +228,6 @@ if __name__ == "__main__":
         model.save_pretrained(tmpdir)
         loaded = Olmo3ForCausalLM.from_pretrained(tmpdir)
         assert loaded.config.vocab_size == model.config.vocab_size
-        assert count_parameters(loaded)["total"] == counts["total"]
+        loaded_total = count_parameters(loaded)["total"]
+        assert loaded_total == counts["total"], f"param count mismatch: {loaded_total} vs {counts['total']}"
         print(f"Save/load round-trip OK ({counts['total']:,} params)")

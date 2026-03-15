@@ -39,6 +39,7 @@ Usage:
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -50,7 +51,6 @@ from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 torch.set_float32_matmul_precision("high")
 
 
-@torch.compile
 def extract_topk_logprobs(logits, k):
     """Extract top-k logprobs from raw logits efficiently.
 
@@ -63,26 +63,19 @@ def extract_topk_logprobs(logits, k):
     return topk_logprobs.half(), topk_indices.int()
 
 
-def read_batch_from_memmap(data, chunk_indices, n_ctx, batch_size, batch_idx):
-    """Read a batch of chunks directly from memmap without pre-loading."""
-    start_idx = batch_idx * batch_size
-    end_idx = min(start_idx + batch_size, len(chunk_indices))
-    batch = torch.zeros(end_idx - start_idx, n_ctx, dtype=torch.long)
-    for i, ci in enumerate(chunk_indices[start_idx:end_idx]):
-        offset = ci * n_ctx
-        batch[i] = torch.from_numpy(data[offset : offset + n_ctx].astype(np.int64))
-    return batch
+def make_empty_rows():
+    return {"input_ids": [], "topk_indices": [], "topk_logprobs": []}
 
 
 def flush_shard(rows, output_path, shard_name, is_hub, rank):
     """Write accumulated rows as a parquet shard (or push to hub)."""
-    shard = Dataset.from_list(rows)
+    shard = Dataset.from_dict(rows)
     if is_hub:
         shard.push_to_hub(output_path, split=shard_name)
     else:
         os.makedirs(output_path, exist_ok=True)
         shard.to_parquet(os.path.join(output_path, f"{shard_name}.parquet"))
-    print(f"[rank {rank}] Saved {shard_name} ({len(rows)} rows)")
+    print(f"[rank {rank}] Saved {shard_name} ({len(rows['input_ids'])} rows)")
 
 
 def main():
@@ -101,6 +94,8 @@ def main():
                         help="Device map for model loading (default: auto for single-process, local GPU for torchrun)")
     parser.add_argument("--compile", action="store_true", default=True, help="Use torch.compile")
     parser.add_argument("--no_compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--max_pending_shards", type=int, default=2,
+                        help="Max number of async shard writes queued before blocking")
     args = parser.parse_args()
 
     use_compile = args.compile and not args.no_compile
@@ -141,8 +136,11 @@ def main():
     if is_main:
         print(f"Total tokens: {num_tokens:,}, chunks of {args.n_ctx}: {num_chunks:,}")
 
+    # Reshape to [num_chunks, n_ctx] so we can do vectorized row indexing.
+    data_chunks = data[: num_chunks * args.n_ctx].reshape(num_chunks, args.n_ctx)
+
     # Shard chunks across ranks (just indices, no data)
-    my_chunk_indices = list(range(rank, num_chunks, world_size))
+    my_chunk_indices = np.arange(rank, num_chunks, world_size, dtype=np.int64)
     if is_main:
         print(f"Rank {rank}/{world_size}: processing {len(my_chunk_indices)} chunks")
 
@@ -166,21 +164,26 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         args.teacher,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
         device_map=device_map,
         quantization_config=quant_config,
     )
     model.eval()
+    model.config.use_cache = False
+
+    def forward_and_extract(batch, k):
+        logits = model(batch, use_cache=False).logits
+        return extract_topk_logprobs(logits, k)
 
     if use_compile:
         if is_main:
             print("Compiling model with torch.compile...")
-        model = torch.compile(model, mode="default")
+        forward_and_extract = torch.compile(forward_and_extract, fullgraph=True, mode="max-autotune")
 
-    rows = []
+    rows = make_empty_rows()
     shard_idx = 0
-    num_batches = len(my_chunk_indices) // args.batch_size
+    num_batches = (len(my_chunk_indices) + args.batch_size - 1) // args.batch_size
 
     # Determine if output is local path or HF Hub repo (e.g. "user/repo-name")
     is_hub = "/" in args.output and not os.path.isabs(args.output) and not args.output.startswith(".")
@@ -188,42 +191,112 @@ def main():
     # Use rank-prefixed shard names to avoid collisions
     shard_prefix = f"rank{rank}_" if world_size > 1 else ""
 
-    for batch_idx in tqdm(range(num_batches), desc=f"[rank {rank}] Processing", disable=not is_main):
-        # Stream batch from memmap
-        batch = read_batch_from_memmap(data, my_chunk_indices, args.n_ctx, args.batch_size, batch_idx)
-        batch_gpu = batch.to(model.device, non_blocking=True)
+    # Arrow list columns use 32-bit offsets and ~2GB buffers; cap rows/shard to avoid overflow.
+    per_row_topk = args.n_ctx * args.top_k
+    max_rows_by_elements = (2**31 - 1) // per_row_topk
+    max_rows_by_bytes = (2**31 - 1) // (per_row_topk * 4)  # int32 topk_indices column is tightest
+    rows_per_shard = max(1, min(args.rows_per_shard, max_rows_by_elements, max_rows_by_bytes))
+    if is_main and rows_per_shard != args.rows_per_shard:
+        print(f"Capping rows_per_shard from {args.rows_per_shard} to {rows_per_shard} for Arrow safety")
 
-        with torch.inference_mode():
-            logits = model(batch_gpu).logits
+    if args.max_pending_shards < 1:
+        raise ValueError("--max_pending_shards must be >= 1")
 
-        topk_logprobs, topk_indices = extract_topk_logprobs(logits, args.top_k)
+    input_device = model.device
+    pin_memory = input_device.type == "cuda"
+    cpu_buffers = [
+        torch.empty((args.batch_size, args.n_ctx), dtype=torch.long, pin_memory=pin_memory),
+        torch.empty((args.batch_size, args.n_ctx), dtype=torch.long, pin_memory=pin_memory),
+    ]
+    staged_input_ids = [None, None]
+    staged_gpu_batches = [None, None]
+    staged_batch_sizes = [0, 0]
 
-        # Transfer to CPU numpy
-        batch_ids = batch.numpy()
-        topk_indices_np = topk_indices.cpu().numpy()
-        topk_logprobs_np = topk_logprobs.cpu().numpy()
+    copy_stream = torch.cuda.Stream(device=input_device) if input_device.type == "cuda" else None
+    ready_events = [torch.cuda.Event() for _ in range(2)] if copy_stream is not None else [None, None]
 
-        for i in range(len(batch_ids)):
-            rows.append({
-                "input_ids": batch_ids[i],
-                "topk_indices": topk_indices_np[i],
-                "topk_logprobs": topk_logprobs_np[i],
-            })
+    def stage_batch(batch_idx, slot):
+        start_idx = batch_idx * args.batch_size
+        end_idx = min(start_idx + args.batch_size, len(my_chunk_indices))
+        batch_chunk_indices = my_chunk_indices[start_idx:end_idx]
+        batch_np = data_chunks[batch_chunk_indices]
+        batch_size = end_idx - start_idx
 
-        # Flush shard if needed
-        if len(rows) >= args.rows_per_shard:
+        staged_input_ids[slot] = batch_np
+        cpu_batch = cpu_buffers[slot]
+        cpu_batch[:batch_size].copy_(torch.from_numpy(batch_np.astype(np.int64, copy=False)))
+        if batch_size < args.batch_size:
+            cpu_batch[batch_size:].zero_()  # pad to fixed shape to avoid torch.compile recompilation
+
+        if copy_stream is None:
+            staged_gpu_batches[slot] = cpu_batch.to(input_device)
+        else:
+            with torch.cuda.stream(copy_stream):
+                staged_gpu_batches[slot] = cpu_batch.to(input_device, non_blocking=True)
+                ready_events[slot].record(copy_stream)
+        staged_batch_sizes[slot] = batch_size
+
+    flush_executor = ThreadPoolExecutor(max_workers=1)
+    pending_flushes = []
+
+    def queue_flush(rows_to_flush, shard_name):
+        future = flush_executor.submit(flush_shard, rows_to_flush, args.output, shard_name, is_hub, rank)
+        pending_flushes.append(future)
+        if len(pending_flushes) >= args.max_pending_shards:
+            pending_flushes.pop(0).result()
+
+    # Prime the pipeline (up to two staged batches).
+    for init_batch_idx in range(min(2, num_batches)):
+        stage_batch(init_batch_idx, init_batch_idx % 2)
+
+    try:
+        for batch_idx in tqdm(range(num_batches), desc=f"[rank {rank}] Processing", disable=not is_main):
+            slot = batch_idx % 2
+            if copy_stream is not None:
+                torch.cuda.current_stream(device=input_device).wait_event(ready_events[slot])
+            batch_gpu = staged_gpu_batches[slot]
+            batch_size = staged_batch_sizes[slot]
+
+            with torch.inference_mode():
+                topk_logprobs, topk_indices = forward_and_extract(batch_gpu, args.top_k)
+
+            # Save input_ids BEFORE staging the next batch (which overwrites staged_input_ids[slot]).
+            batch_ids = staged_input_ids[slot].astype(np.uint32, copy=False)
+
+            # Stage batch i+2 into the now-free slot to overlap copy with next compute.
+            next_batch_idx = batch_idx + 2
+            if next_batch_idx < num_batches:
+                stage_batch(next_batch_idx, slot)
+
+            # Transfer to CPU numpy in one step.
+            topk_indices_np = topk_indices.cpu().numpy()
+            topk_logprobs_np = topk_logprobs.cpu().numpy()
+
+            rows["input_ids"].extend(batch_ids[:batch_size])
+            rows["topk_indices"].extend(topk_indices_np[:batch_size])
+            rows["topk_logprobs"].extend(topk_logprobs_np[:batch_size])
+
+            # Flush shard if needed
+            if len(rows["input_ids"]) >= rows_per_shard:
+                shard_name = f"train_{shard_prefix}{shard_idx}"
+                rows_to_flush = rows
+                rows = make_empty_rows()
+                queue_flush(rows_to_flush, shard_name)
+                shard_idx += 1
+    finally:
+        # Flush remaining rows
+        if rows["input_ids"]:
             shard_name = f"train_{shard_prefix}{shard_idx}"
-            flush_shard(rows, args.output, shard_name, is_hub, rank)
-            rows = []
+            queue_flush(rows, shard_name)
             shard_idx += 1
 
-    # Flush remaining rows
-    if rows:
-        shard_name = f"train_{shard_prefix}{shard_idx}"
-        flush_shard(rows, args.output, shard_name, is_hub, rank)
+        # Wait for all async writes to finish and surface any exceptions.
+        while pending_flushes:
+            pending_flushes.pop(0).result()
+        flush_executor.shutdown(wait=True)
 
     if is_main:
-        total_shards = (shard_idx + 1) * world_size
+        total_shards = shard_idx * world_size
         print(f"Done! ~{total_shards} total shards across {world_size} rank(s)")
 
     if ddp:

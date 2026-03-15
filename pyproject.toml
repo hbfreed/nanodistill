@@ -5,45 +5,26 @@ description = "Does the teacher matter? Off-policy knowledge distillation experi
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.12.0",
     "bitsandbytes",
+    "cut-cross-entropy @ git+https://github.com/apple/ml-cross-entropy.git@main",
     "datasets>=3.0.0",
-    "liger-kernel",
+    "liger-kernel>=0.5.0",
     "numpy",
     "psutil",
     "tiktoken>=0.8.0",
+    "torch>=2.8.0",
     "tqdm",
     "transformers>=4.50.0",
     "wandb",
 ]
 
-[project.optional-dependencies]
-cpu = [
-    "torch>=2.8.0",
-]
-gpu = [
-    "torch>=2.8.0",
-]
-
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu128", extra = "gpu" },
+    { index = "pytorch-cu128" },
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
-
-[tool.uv]
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "gpu" },
-    ],
-]
