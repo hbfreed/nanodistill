@@ -64,6 +64,7 @@ def extract_topk_logprobs(logits, k):
 
 
 def make_empty_rows():
+    """Return an empty accumulator dict for a parquet shard's three columns."""
     return {"input_ids": [], "topk_indices": [], "topk_logprobs": []}
 
 
@@ -79,6 +80,7 @@ def flush_shard(rows, output_path, shard_name, is_hub, rank):
 
 
 def main():
+    """Run teacher inference over tokenized data and write top-k logprobs as parquet shards."""
     parser = argparse.ArgumentParser(description="Generate teacher logprobs for distillation")
     parser.add_argument("--teacher", type=str, required=True, help="HF model name for teacher")
     parser.add_argument("--data", type=str, required=True, help="Path to tokenized .bin file")
@@ -173,6 +175,7 @@ def main():
     model.config.use_cache = False
 
     def forward_and_extract(batch, k):
+        """Forward pass through teacher, returning top-k logprobs and indices."""
         logits = model(batch, use_cache=False).logits
         return extract_topk_logprobs(logits, k)
 
@@ -216,6 +219,7 @@ def main():
     ready_events = [torch.cuda.Event() for _ in range(2)] if copy_stream is not None else [None, None]
 
     def stage_batch(batch_idx, slot):
+        """Load a batch from memmap into a pinned CPU buffer and async-copy it to GPU."""
         start_idx = batch_idx * args.batch_size
         end_idx = min(start_idx + args.batch_size, len(my_chunk_indices))
         batch_chunk_indices = my_chunk_indices[start_idx:end_idx]
@@ -240,6 +244,7 @@ def main():
     pending_flushes = []
 
     def queue_flush(rows_to_flush, shard_name):
+        """Submit a shard write to the background thread, blocking if too many are pending."""
         future = flush_executor.submit(flush_shard, rows_to_flush, args.output, shard_name, is_hub, rank)
         pending_flushes.append(future)
         if len(pending_flushes) >= args.max_pending_shards:

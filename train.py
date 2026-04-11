@@ -423,6 +423,7 @@ def estimate_loss():
 cooldown_iters = int(max_iters * cooldown_fraction)  # for wsd schedule
 
 def get_lr(it):
+    """Compute learning rate at step `it` using warmup + cosine or WSD schedule."""
     # Warmup (shared by both schedules)
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
