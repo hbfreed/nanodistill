@@ -56,12 +56,14 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups, lr=1e-3, betas=(0.9, 0.95), eps=1e-8,
                  weight_decay=0.0, momentum=0.95, nesterov=True, ns_steps=5):
+        """Set shared defaults; each param group must include kind='muon' or kind='adamw'."""
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
                         momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
+        """Dispatch each param group to its Muon or AdamW update."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -76,6 +78,7 @@ class MuonAdamW(torch.optim.Optimizer):
         return loss
 
     def _muon_step(self, group):
+        """SGD-momentum step with Newton-Schulz orthogonalization and optional per-head split."""
         lr = group["lr"]
         momentum = group.get("momentum", 0.95)
         nesterov = group.get("nesterov", True)
@@ -113,6 +116,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr * max(1, p.size(-2) / p.size(-1)) ** 0.5)
 
     def _adamw_step(self, group):
+        """Bias-corrected AdamW with decoupled weight decay in float32."""
         lr = group["lr"]
         beta1, beta2 = group.get("betas", (0.9, 0.95))
         eps = group.get("eps", 1e-8)

@@ -53,6 +53,7 @@ def compute_token_bytes(tokenizer):
 
 
 def main():
+    """Tokenize FineWeb-Edu, write train/val .bin memmaps, token_bytes.pt, and meta.pkl."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tokenizer",
@@ -99,6 +100,7 @@ def main():
 
     # Tokenize
     def process(example):
+        """Tokenize a single document and append the EOT token."""
         ids = tokenizer.encode(example["text"], add_special_tokens=False)
         ids.append(eot_token_id)
         return {"ids": ids, "len": len(ids)}
