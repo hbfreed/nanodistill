@@ -201,7 +201,6 @@ def count_parameters(model) -> dict:
 
 if __name__ == "__main__":
     import tempfile
-    from pathlib import Path
 
     # --- Test with different vocab sizes ---
     # These show how the same ~75M transformer core gets different total

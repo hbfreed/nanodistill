@@ -40,7 +40,7 @@ for arg in sys.argv[1:]:
                 attempt = val
             # ensure the types match ok (allow None to be overridden by any type)
             if globals()[key] is not None:
-                assert type(attempt) == type(globals()[key])
+                assert isinstance(attempt, type(globals()[key]))
             # cross fingers
             print(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt
