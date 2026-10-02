@@ -26,6 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from cut_cross_entropy import linear_cross_entropy
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from model import configure_muon_adamw, configure_optimizers, create_student
+from sparse_kl import sparse_kl_loss
 
 # -----------------------------------------------------------------------------
 # default config values
@@ -40,9 +41,11 @@ init_from = "scratch"  # 'scratch' or 'resume'
 
 # Training mode
 mode = "ce"  # "ce" for cross-entropy baseline, "distill" for KL distillation
-logprobs_path = ""  # HF dataset path for distillation (e.g., "hbfreed/olmo-fineweb-logprobs")
-top_k = 128
+teacher_model = ""       # HF model name for online distillation
+teacher_quantize = ""    # "" (bf16), "int8", or "int4"
+temperature = 1.0        # KD temperature
 alpha = 1.0  # KL weight in mixed loss: loss = alpha*KL + (1-alpha)*CE. Use 0.9 per Peng et al.
+logprob_dir = ""  # dir of parquet shards from generate_logprobs.py (offline distill)
 
 # Ablation knobs
 optimizer_type = "adamw"  # "adamw" or "muon"
@@ -106,7 +109,11 @@ if ddp:
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
+    if mode == "distill" and not logprob_dir:
+        # Online distill: GPU 0 reserved for teacher; student ranks start at GPU 1
+        device = f"cuda:{ddp_local_rank + 1}"
+    else:
+        device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
@@ -178,124 +185,102 @@ def get_batch(split, bs=None):
     return x, y
 
 
-# --- Distillation data loading ---
-distill_train_loader = None
-distill_train_iter = None
+# --- Offline distillation data loading ---
+# Reads parquet shards written by generate_logprobs.py (columns: input_ids,
+# topk_indices, topk_logprobs). Each row carries its own input_ids, so student
+# input and teacher logprobs are aligned by construction.
+_top_k = 0
+_offline_shards = []
+_offline_shard_pos = 0
+_offline_ids = _offline_idx = _offline_lp = None
+_offline_perm = None
+_offline_row = 0
 
-if mode == "distill":
+if mode == "distill" and logprob_dir:
     import glob
-    import pyarrow.parquet as pq
-    import numpy as np
-    import threading
     import random as pyrandom
-    from torch.utils.data import DataLoader, Dataset
+    import pyarrow.parquet as pq
 
-    class ParquetShardDataset(Dataset):
-        """Map-style dataset that loads one parquet shard at a time.
-        A background thread pre-reads the next shard while the GPU trains."""
+    _offline_shards = sorted(glob.glob(os.path.join(logprob_dir, "*.parquet")))
+    assert _offline_shards, f"No parquet files found in {logprob_dir}"
+    _shard_rng = pyrandom.Random(1337)
+    _shard_rng.shuffle(_offline_shards)
+    if ddp:  # disjoint shard subsets per rank
+        _offline_shards = [s for i, s in enumerate(_offline_shards) if i % ddp_world_size == ddp_rank]
+    _row_rng = np.random.default_rng(1337 + seed_offset)
 
-        def __init__(self, parquet_files, seed=1337):
-            self.files = parquet_files
-            self.rng = pyrandom.Random(seed)
-            self._load_shard(0)
-            self._prefetch_next(1)
+    def _read_shard(path):
+        table = pq.read_table(path)
+        n = len(table)
+        ids = table["input_ids"].combine_chunks().flatten().to_numpy().astype(np.int64).reshape(n, -1)
+        idx = table["topk_indices"].combine_chunks().flatten().flatten().to_numpy().astype(np.int64)
+        lp = table["topk_logprobs"].combine_chunks().flatten().flatten().to_numpy().astype(np.float32)
+        k = idx.size // (n * ids.shape[1])
+        return ids, idx.reshape(n, ids.shape[1], k), lp.reshape(n, ids.shape[1], k)
 
-        def _read_shard(self, path):
-            table = pq.read_table(path)
-            n = len(table)
-            ids = table["input_ids"].combine_chunks().flatten().to_numpy().astype(np.uint32).reshape(n, 2048)
-            idx = table["topk_indices"].combine_chunks().flatten().flatten().to_numpy().astype(np.int32).reshape(n, 2048, 128)
-            lp = np.array(table["topk_logprobs"].combine_chunks().flatten().flatten(), dtype=np.float16).reshape(n, 2048, 128)
-            return ids, idx, lp
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    _shard_pool = ThreadPoolExecutor(max_workers=1)
+    _next_shard_future = None
 
-        def _load_shard(self, shard_idx):
-            self.shard_idx = shard_idx % len(self.files)
-            self.ids, self.idx, self.lp = self._read_shard(self.files[self.shard_idx])
-            # Shuffle row order within shard
-            self._perm = list(range(len(self.ids)))
-            self.rng.shuffle(self._perm)
-            self._row = 0
+    def _submit_next_shard():
+        global _next_shard_future, _offline_shard_pos
+        path = _offline_shards[_offline_shard_pos % len(_offline_shards)]
+        _offline_shard_pos += 1
+        _next_shard_future = _shard_pool.submit(_read_shard, path)
 
-        def _prefetch_next(self, shard_idx):
-            si = shard_idx % len(self.files)
-            self._next_future = [None, None, None]
-            def _read():
-                self._next_future[:] = self._read_shard(self.files[si])
-            self._prefetch_thread = threading.Thread(target=_read, daemon=True)
-            self._prefetch_thread.start()
-            self._next_shard_idx = shard_idx
+    def _load_next_shard():
+        """Swap in the prefetched shard (decoding parquet takes ~1 min) and prefetch the next."""
+        global _offline_ids, _offline_idx, _offline_lp, _offline_perm, _offline_row, _top_k
+        _offline_ids, _offline_idx, _offline_lp = _next_shard_future.result()
+        _submit_next_shard()
+        assert _offline_ids.shape[1] == n_ctx, f"Teacher seq_len {_offline_ids.shape[1]} != n_ctx {n_ctx}"
+        _top_k = _offline_idx.shape[2]
+        _offline_perm = _row_rng.permutation(len(_offline_ids))
+        _offline_row = 0
 
-        def __len__(self):
-            return len(self.ids)
-
-        def __getitem__(self, idx):
-            row = self._perm[idx]
-            return {
-                "input_ids": torch.from_numpy(self.ids[row].copy()),
-                "topk_indices": torch.from_numpy(self.idx[row].copy()),
-                "topk_logprobs": torch.from_numpy(self.lp[row].copy()),
-            }
-
-        def advance_shard(self):
-            """Call between epochs/shard exhaustion to swap in prefetched shard."""
-            self._prefetch_thread.join()
-            next_idx = self._next_shard_idx
-            self.shard_idx = next_idx % len(self.files)
-            self.ids, self.idx, self.lp = self._next_future
-            self._perm = list(range(len(self.ids)))
-            self.rng.shuffle(self._perm)
-            self._row = 0
-            self._prefetch_next(next_idx + 1)
-
-    def collate_fn(batch):
-        return {
-            "input_ids": torch.stack([b["input_ids"] for b in batch]),
-            "teacher_indices": torch.stack([b["topk_indices"] for b in batch]),
-            "teacher_logits": torch.stack([b["topk_logprobs"] for b in batch]),
-        }
-
+    _submit_next_shard()
+    _load_next_shard()
     if master_process:
-        print(f"Loading distillation logprobs from {logprobs_path}...")
-
-    all_shards = sorted(glob.glob(os.path.join(logprobs_path, "*.parquet")))
-    assert len(all_shards) > 0, f"No parquet files found in {logprobs_path}"
-
-    # Shuffle shard order, then split across DDP ranks
-    shard_rng = pyrandom.Random(1337)
-    shard_rng.shuffle(all_shards)
-    if ddp:
-        all_shards = [s for i, s in enumerate(all_shards) if i % ddp_world_size == ddp_rank]
-
-    if master_process:
-        print(f"Total shards: {len(all_shards) * ddp_world_size}, this rank: {len(all_shards)}")
-
-    train_dataset = ParquetShardDataset(all_shards, seed=1337 + seed_offset)
-    distill_train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
-    distill_train_iter = iter(distill_train_loader)
-
+        print(f"Loaded offline teacher logprobs from {logprob_dir}: "
+              f"{len(_offline_shards) * ddp_world_size} shards, top_k={_top_k}")
 
 def get_distill_batch():
-    """Get next batch from distillation dataloader. Advances to next shard when exhausted."""
-    global distill_train_iter
-    try:
-        batch = next(distill_train_iter)
-    except StopIteration:
-        train_dataset.advance_shard()
-        distill_train_iter = iter(distill_train_loader)
-        batch = next(distill_train_iter)
-    # Move to device
-    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-    batch["input_ids"] = batch["input_ids"].long()
-    batch["teacher_indices"] = batch["teacher_indices"].long()
-    return batch
+    """Next batch of (input_ids, teacher_topk_ids, teacher_topk_logprobs) from parquet shards."""
+    global _offline_row
+    if _offline_row + batch_size > len(_offline_perm):
+        _load_next_shard()
+    rows = _offline_perm[_offline_row : _offline_row + batch_size]
+    _offline_row += batch_size
+    x = torch.from_numpy(_offline_ids[rows])
+    t_ids = torch.from_numpy(_offline_idx[rows])
+    t_lps = torch.from_numpy(_offline_lp[rows])
+    if device_type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        t_ids = t_ids.pin_memory().to(device, non_blocking=True)
+        t_lps = t_lps.pin_memory().to(device, non_blocking=True)
+    else:
+        x, t_ids, t_lps = x.to(device), t_ids.to(device), t_lps.to(device)
+    return x, t_ids, t_lps
+
+
+# --- Online distillation pipeline ---
+def teacher_worker(teacher_ref, data, n_ctx, total_bs, t_device, temperature, queue, seed):
+    """Daemon thread: run teacher inference, push (input_ids_cpu, logprobs_cpu) to queue."""
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    data_len = len(data) - n_ctx
+    while True:
+        ix = torch.randint(data_len, (total_bs,), generator=rng)
+        x = torch.stack([torch.from_numpy(data[i : i + n_ctx].astype(np.int64)) for i in ix])
+        x_gpu = x.to(t_device)
+        with torch.no_grad():
+            logits = teacher_ref(x_gpu).logits.float()
+            if temperature != 1.0:
+                logits.div_(temperature)
+            logprobs = F.log_softmax(logits, dim=-1)
+            del logits
+        queue.put((x, logprobs.cpu()))
 
 
 # --- Model init ---
@@ -321,7 +306,19 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 else:
-    raise ValueError(f"Unknown init_from: {init_from}")
+    # init_from is a path to a pretrained checkpoint (model weights only, fresh optimizer)
+    ckpt_path = init_from if os.path.isfile(init_from) else os.path.join(init_from, "ckpt.pt")
+    if master_process:
+        print(f"Loading pretrained weights from {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = create_student(checkpoint["model_args"]["vocab_size"])
+    state_dict = checkpoint["model"]
+    unwanted_prefix = "_orig_mod."
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    checkpoint = None  # fresh optimizer, iter_num=0
 
 # Muon: float32 weights + autocast(bf16) forward. OLMo3's ungated residuals
 # amplify backward gradients ~1000x/layer → bf16 precision collapse at layer 0.
@@ -334,7 +331,7 @@ else:
     model.to(device=device, dtype=torch.bfloat16)
 
 # Print parameter counts
-from model import count_parameters
+from model import count_parameters  # noqa: E402
 if master_process:
     counts = count_parameters(model)
     print(f"Total params: {counts['total']:,}")
@@ -352,18 +349,50 @@ if init_from == "resume":
     optimizer.load_state_dict(checkpoint["optimizer"])
     checkpoint = None  # free memory
 
+# --- Teacher loading (online distillation) ---
+teacher = None
+teacher_device = None
+if mode == "distill" and not logprob_dir:
+    from transformers import AutoModelForCausalLM
+    assert teacher_model, "teacher_model required for online distill mode"
+    teacher_device = "cuda:0" if ddp else device
+    if not ddp or ddp_local_rank == 0:
+        quant_config = None
+        if teacher_quantize == "int8":
+            from transformers import BitsAndBytesConfig
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        elif teacher_quantize == "int4":
+            from transformers import BitsAndBytesConfig
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            )
+        if master_process:
+            print(f"Loading teacher: {teacher_model} ({teacher_quantize or 'bf16'}) on {teacher_device}")
+        teacher = AutoModelForCausalLM.from_pretrained(
+            teacher_model,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            device_map={"": teacher_device},
+            quantization_config=quant_config,
+        )
+        teacher.eval()
+        teacher.config.use_cache = False
+        assert teacher.config.vocab_size == vocab_size, (
+            f"Teacher vocab {teacher.config.vocab_size} != config vocab_size {vocab_size}"
+        )
+
 # Compile
 if compile:
     if master_process:
         print("Compiling the model... (takes a ~minute)")
-    if mode == "ce":
-        model.model = torch.compile(model.model)  # backbone only — lm_head handled by fused CE
-    else:
-        model = torch.compile(model)
+    model.model = torch.compile(model.model)  # backbone only — lm_head handled explicitly
 
 # DDP — wrap backbone only so fused CE can handle lm_head directly
 if ddp:
-    model.model = DDP(model.model, device_ids=[ddp_local_rank])
+    ddp_device_id = ddp_local_rank + 1 if (mode == "distill" and not logprob_dir) else ddp_local_rank
+    model.model = DDP(model.model, device_ids=[ddp_device_id])
 
 
 # --- Evaluation ---
@@ -474,8 +503,27 @@ def _clean_state_dict(m):
 # --- Training loop ---
 if mode == "ce":
     X, Y = get_batch("train")  # prefetch first batch
+elif mode == "distill" and logprob_dir:
+    X, t_ids, t_lps = get_distill_batch()  # prefetch first batch
 elif mode == "distill":
-    distill_batch = get_distill_batch()
+    from queue import Queue
+    from threading import Thread
+    train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint32, mode="r")
+    total_batch_size_teacher = ddp_world_size * batch_size
+    if not ddp or ddp_local_rank == 0:
+        teacher_queue = Queue(maxsize=4)
+        teacher_thread = Thread(
+            target=teacher_worker,
+            args=(teacher, train_data, n_ctx, total_batch_size_teacher,
+                  teacher_device, temperature, teacher_queue, seed),
+            daemon=True,
+        )
+        teacher_thread.start()
+        teacher = None  # thread owns the reference
+        if master_process:
+            print(f"Teacher pipeline started (queue maxsize=4, batch={total_batch_size_teacher})")
+    else:
+        teacher_queue = None
 
 t0 = time.time()
 local_iter_num = 0
@@ -543,6 +591,26 @@ while True:
         if ddp:
             model.model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
 
+        # Online distill: pull teacher logprobs from queue + broadcast to all ranks
+        if mode == "distill" and not logprob_dir:
+            if not ddp or ddp_local_rank == 0:
+                all_X_cpu, all_logprobs_cpu = teacher_queue.get()
+                all_X = all_X_cpu.to(device)
+                all_logprobs = all_logprobs_cpu.to(device)
+            if ddp:
+                if ddp_local_rank != 0:
+                    all_X = torch.empty(total_batch_size_teacher, n_ctx, dtype=torch.long, device=device)
+                    all_logprobs = torch.empty(total_batch_size_teacher, n_ctx, vocab_size,
+                                               dtype=torch.float32, device=device)
+                torch.distributed.broadcast(all_X, src=0)
+                torch.distributed.broadcast(all_logprobs, src=0)
+                X = all_X[ddp_rank * batch_size : (ddp_rank + 1) * batch_size].clone()
+                my_teacher_logprobs = all_logprobs[ddp_rank * batch_size : (ddp_rank + 1) * batch_size].clone()
+                del all_X, all_logprobs
+            else:
+                X = all_X
+                my_teacher_logprobs = all_logprobs
+
         with amp_ctx:
             if mode == "ce":
                 # Backbone forward — goes through DDP wrapper if ddp, handles gradient sync
@@ -568,35 +636,68 @@ while True:
                         Y.reshape(-1),
                         bias=getattr(raw_model.lm_head, "bias", None),
                     ).mean()
+            elif mode == "distill" and logprob_dir:
+                # Offline sparse KL from pre-computed top-k teacher logprobs (see sparse_kl.py):
+                # true student log-probs (logit - full-vocab lse from CCE) plus an explicit
+                # tail bucket for the mass outside the top-k. Renormalizing both sides over
+                # the top-k alone is invariant to the student's tail mass and cannot
+                # calibrate the full-vocab distribution.
+                assert temperature == 1.0, "temperature != 1 not supported for sparse offline KL"
+                hidden = model.model(X).last_hidden_state  # (B, T, D)
+                h = hidden.reshape(-1, hidden.size(-1))
+                if h.dtype not in (torch.bfloat16, torch.float16):
+                    h = h.bfloat16()
+                targets = None
+                if alpha < 1.0:
+                    # next-token targets; -1 marks the last position (no target)
+                    targets = torch.cat([X[:, 1:], X.new_full((X.size(0), 1), -1)], dim=1).reshape(-1)
+                kl_loss, ce_loss = sparse_kl_loss(
+                    h, raw_model.lm_head.weight,
+                    t_ids.reshape(-1, _top_k), t_lps.reshape(-1, _top_k), targets=targets,
+                )
+                loss = kl_loss if alpha >= 1.0 else alpha * kl_loss + (1 - alpha) * ce_loss
+
             elif mode == "distill":
-                # Backbone forward — goes through DDP wrapper for gradient sync
-                hidden = model.model(distill_batch["input_ids"]).last_hidden_state
-                logits = raw_model.lm_head(hidden)  # (B, T, V) — needed for KL gather
-                # KL: gather student logits at teacher's top-k indices
-                student_topk = logits.gather(-1, distill_batch["teacher_indices"])  # (B, T, k)
-                student_at_topk = F.log_softmax(student_topk.float(), dim=-1)
-                teacher_logprobs = F.log_softmax(distill_batch["teacher_logits"].float(), dim=-1)  # renormalize over top-k
-                kl_loss = F.kl_div(student_at_topk, teacher_logprobs, log_target=True, reduction="batchmean") / n_ctx
+                # Full-vocab online KL distillation
+                hidden = model.model(X).last_hidden_state
+                student_logits = raw_model.lm_head(hidden)
+                if temperature != 1.0:
+                    student_logits = student_logits / temperature
+                student_logprobs = F.log_softmax(student_logits.float(), dim=-1)
+                del student_logits
+                kl_loss = F.kl_div(student_logprobs, my_teacher_logprobs,
+                                   log_target=True, reduction="batchmean") / n_ctx
+                del student_logprobs, my_teacher_logprobs
+                if temperature != 1.0:
+                    kl_loss = kl_loss * (temperature ** 2)
 
                 if alpha < 1.0:
-                    # CE from hidden states: fused linear+CE avoids 7.6 GB float32 expansion
                     shift_hidden = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
-                    shift_labels = distill_batch["input_ids"][:, 1:].reshape(-1)
-                    ce_loss = fused_ce(
-                        raw_model.lm_head.weight, shift_hidden, shift_labels,
-                        bias=getattr(raw_model.lm_head, "bias", None),
-                    ).mean()
+                    shift_labels = X[:, 1:].reshape(-1)
+                    if cce_impl in ("cce", "cce_exact"):
+                        h = shift_hidden
+                        if h.dtype not in (torch.bfloat16, torch.float16):
+                            h = h.bfloat16()
+                        ce_loss = linear_cross_entropy(
+                            h, raw_model.lm_head.weight, shift_labels,
+                            impl=cce_impl, filter_eps=cce_filter_eps,
+                        )
+                    else:
+                        ce_loss = fused_ce(
+                            raw_model.lm_head.weight, shift_hidden, shift_labels,
+                            bias=getattr(raw_model.lm_head, "bias", None),
+                        ).mean()
                     loss = alpha * kl_loss + (1 - alpha) * ce_loss
                 else:
                     loss = kl_loss
 
         loss = loss / gradient_accumulation_steps
 
-        # Prefetch next batch (overlaps with backward)
+        # Prefetch next batch (online distill pulls from queue above)
         if mode == "ce":
             X, Y = get_batch("train")
-        elif mode == "distill":
-            distill_batch = get_distill_batch()
+        elif mode == "distill" and logprob_dir:
+            X, t_ids, t_lps = get_distill_batch()
 
         loss.backward()
         # lm_head is outside DDP — manually sync its gradients

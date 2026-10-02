@@ -24,7 +24,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-num_proc = 12
+num_proc = 24
 
 
 def compute_token_bytes(tokenizer):
@@ -86,7 +86,9 @@ def main():
     # Load FineWeb-Edu sample-10BT
     print("Loading FineWeb-Edu sample-10BT...")
     dataset = load_dataset(
-        "HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train",
+        "HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        split="train",
         num_proc=num_proc,
     )
 

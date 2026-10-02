@@ -18,5 +18,5 @@ eval_interval = 1000
 learning_rate = 6e-4
 min_lr = 6e-5
 
-cce_impl = "cce"
+cce_impl = "cce_exact"
 optimizer_type = "adamw"

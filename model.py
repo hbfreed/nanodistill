@@ -13,7 +13,29 @@ since each teacher family uses a different tokenizer.
 """
 
 import torch
-from transformers import Olmo3Config, Olmo3ForCausalLM
+from transformers import AttentionInterface, Olmo3Config, Olmo3ForCausalLM
+
+
+def _causal_sdpa(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
+    """SDPA with is_causal=True and no explicit mask.
+
+    HF's default "sdpa" path refuses to drop the causal mask when it detects tracing
+    (masking_utils._ignore_causal_mask_sdpa), so under torch.compile SDPA receives an
+    explicit mask and falls off the FlashAttention kernel onto the memory-efficient one
+    (attention backward 324 ms vs 44 ms at 12x2048). Passing is_causal=True keeps flash
+    in both eager and compiled mode: compiled backbone 313 ms vs 511 ms eager.
+    Only valid when every layer's window >= sequence length (asserted in create_student).
+    """
+    q, k, v = query, key, value
+    if k.shape[1] != q.shape[1]:  # GQA: expand KV heads
+        rep = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling)
+    return out.transpose(1, 2).contiguous(), None
+
+
+AttentionInterface.register("sdpa_causal", _causal_sdpa)
 
 
 def create_student(
@@ -48,6 +70,13 @@ def create_student(
     )
 
     model = Olmo3ForCausalLM(config)
+    # Mask-free causal attention (see _causal_sdpa). Equivalent to the default only if no
+    # sliding-window layer has a window shorter than the context.
+    assert getattr(config, "sliding_window", None) is None or config.sliding_window >= max_position_embeddings, (
+        f"sliding_window={config.sliding_window} < max_position_embeddings={max_position_embeddings}; "
+        "mask-free causal SDPA would be wrong"
+    )
+    model.config._attn_implementation = "sdpa_causal"
     return model
 
 
